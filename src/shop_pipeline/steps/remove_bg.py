@@ -12,6 +12,8 @@ from pathlib import Path
 from PIL import Image
 from rembg import remove
 
+from shop_pipeline.image_utils import fit_image_on_square_canvas
+
 # Limits
 MAX_INPUT_BYTES = 10 * 1024 * 1024  # 10 MB
 SUPPORTED_FORMATS = {".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif"}
@@ -82,13 +84,6 @@ def remove_background_to_white(
     canvas = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
     canvas.alpha_composite(rgba)
 
-    # Resize to square, keeping aspect ratio, centered
-    rgb = canvas.convert("RGB")
-    w, h = rgb.size
-    side = min(w, h)
-    left = (w - side) // 2
-    top = (h - side) // 2
-    cropped = rgb.crop((left, top, left + side, top + side))
-    final = cropped.resize((square_size, square_size), Image.LANCZOS)
+    final = fit_image_on_square_canvas(canvas, square_size=square_size)
     final.save(dst, format="PNG")
     return dst

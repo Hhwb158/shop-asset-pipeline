@@ -44,3 +44,9 @@ def test_all_product_types_have_same_scene_count():
     for ptype in PRODUCT_TYPES:
         scenes = get_scenes(ptype, "x")
         assert len(scenes) == 4, f"{ptype} has {len(scenes)} scenes"
+
+
+def test_all_scene_prompts_are_square_product_images():
+    for ptype in PRODUCT_TYPES:
+        scenes = get_scenes(ptype, "x")
+        assert {scene["aspect_ratio"] for scene in scenes} == {"1:1"}

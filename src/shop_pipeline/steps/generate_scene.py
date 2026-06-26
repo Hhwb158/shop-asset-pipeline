@@ -1,6 +1,11 @@
 """Scene image generation step.
 
-Combines DashScope client with prompt templates to produce multiple scene images.
+Provider-agnostic. Pass an image client (DashScope or MiniMax) and it will
+generate multiple scene images for the product.
+
+Public functions:
+    generate_scenes_v2 — accepts a pre-selected client (preferred)
+    generate_scenes   — legacy direct-DashScope (kept for back-compat)
 """
 
 from __future__ import annotations
@@ -12,10 +17,7 @@ from pathlib import Path
 
 import httpx
 
-from shop_pipeline.clients.dashscope_client import (
-    ImageResult,
-    generate_scene_image,
-)
+from shop_pipeline.clients import ImageGenerationCall
 from shop_pipeline.logging_setup import get_logger
 from shop_pipeline.prompts import get_scenes
 
@@ -40,6 +42,17 @@ def _download_to(url: str, dst: Path, client: httpx.Client) -> None:
                 f.write(chunk)
 
 
+def _extract_url(result: object) -> str:
+    """Both DashScope and MiniMax results expose a single URL field."""
+    url = getattr(result, "url", None)
+    if url is not None:
+        return url
+    urls = getattr(result, "urls", None)
+    if urls:
+        return urls[0]
+    raise RuntimeError(f"image result has no URL: {result!r}")
+
+
 def generate_scenes(
     api_key: str,
     product_image_path: Path,
@@ -49,23 +62,55 @@ def generate_scenes(
     on_progress: Callable[[str], None] | None = None,
     client: httpx.Client | None = None,
 ) -> list[SceneOutput]:
-    """Generate multiple scene images for a product.
+    """[Legacy] Generate scenes using DashScope directly.
+
+    Kept for back-compat — new code should use generate_scenes_v2.
+
+    The DashScope client is looked up at call time from its module so that
+    tests can monkeypatch it.
+    """
+    import importlib
+
+    ds_mod = importlib.import_module("shop_pipeline.clients.dashscope_client")
+    return generate_scenes_v2(
+        image_client=ds_mod.generate_scene_image,  # type: ignore[arg-type]
+        api_key=api_key,
+        product_image_path=product_image_path,
+        product_type=product_type,
+        product_desc=product_desc,
+        out_dir=out_dir,
+        on_progress=on_progress,
+        client=client,
+    )
+
+
+def generate_scenes_v2(
+    image_client: ImageGenerationCall,
+    api_key: str,
+    product_image_path: Path,
+    product_type: str,
+    product_desc: str,
+    out_dir: Path,
+    on_progress: Callable[[str], None] | None = None,
+    client: httpx.Client | None = None,
+) -> list[SceneOutput]:
+    """Generate multiple scene images using a pluggable image client.
 
     Args:
-        api_key: DashScope API key
-        product_image_path: local path to the product image (used as reference)
+        image_client: callable matching ImageGenerationCall protocol
+            (e.g. shop_pipeline.clients.dashscope_client.generate_scene_image
+             or shop_pipeline.clients.minimax_image_client.generate_image)
+        api_key: API key for the chosen provider
+        product_image_path: local path to the product image (used as reference
+            for providers that support it)
         product_type: clothing | electronics | food | other
-        product_desc: short description of the product (used in prompts)
+        product_desc: short product description (used in prompts)
         out_dir: directory to save generated images
         on_progress: optional callback(scene_name) for UI progress
         client: optional httpx.Client (for testing)
 
     Returns:
         list of SceneOutput with local file paths
-
-    Raises:
-        ValueError: unknown product_type
-        DashScopeError: API failure
     """
     scenes = get_scenes(product_type, product_desc)
     log.info("generating %d scenes for %s", len(scenes), product_type)
@@ -79,15 +124,26 @@ def generate_scenes(
             if on_progress:
                 on_progress(scene["name"])
             log.info("scene: %s (%s)", scene["name"], scene["aspect_ratio"])
-            result: ImageResult = generate_scene_image(
+            # image_client protocols do not all accept `client`; check signature
+            import inspect
+
+            try:
+                sig = inspect.signature(image_client)
+                accepts_client = "client" in sig.parameters
+            except (TypeError, ValueError):
+                accepts_client = False
+            kwargs = dict(
                 api_key=api_key,
                 prompt=scene["prompt"],
                 product_image_path=product_image_path,
                 aspect_ratio=scene["aspect_ratio"],
-                client=http,
             )
+            if accepts_client:
+                kwargs["client"] = http
+            result = image_client(**kwargs)
+            url = _extract_url(result)
             out_path = out_dir / f"scene-{scene['name']}.png"
-            _download_to(result.url, out_path, http)
+            _download_to(url, out_path, http)
             outputs.append(
                 SceneOutput(
                     name=scene["name"],

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 from PIL import Image
 
+from shop_pipeline.clients import ImageProvider, get_image_client, list_available_providers
 from shop_pipeline.config import Config
 from shop_pipeline.pipeline import run_pipeline
 
@@ -17,20 +19,13 @@ def _png_bytes(color=(200, 50, 50), size=(200, 200)) -> bytes:
     return buf.getvalue()
 
 
-def _make_config(dashscope: str = "ds", kling_key: str = "ak", kling_secret: str = "sk") -> Config:
-    return Config(
-        dashscope_api_key=dashscope,
-        kling_api_key=kling_key,
-        kling_api_secret=kling_secret,
-    )
-
-
 def test_pipeline_white_bg_only_when_no_keys(tmp_path):
     """Without any API keys, pipeline still produces white-bg main image."""
     product = tmp_path / "product.png"
     Image.new("RGB", (200, 200), (200, 50, 50)).save(product)
     cfg = Config(
-        dashscope_api_key=None, kling_api_key=None, kling_api_secret=None
+        dashscope_api_key=None, kling_api_key=None,
+        kling_api_secret=None, minimax_api_key=None,
     )
     work = tmp_path / "out"
 
@@ -56,30 +51,28 @@ def test_pipeline_with_dashscope_generates_scenes(tmp_path, monkeypatch):
     image_bytes = _png_bytes()
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST":
-            return httpx.Response(
-                200,
-                json={"output": {"task_id": "t1", "results": [{"url": "https://cdn/scene.png"}]}},
-            )
-        if request.url.path.endswith("/scene.png"):
+        if "cdn.test" in str(request.url):
             return httpx.Response(200, content=image_bytes)
-        return httpx.Response(404)
+        return httpx.Response(500)
 
     transport = httpx.MockTransport(handler)
-    httpx.Client(transport=transport, base_url="https://dashscope.aliyuncs.com")
+    client = httpx.Client(transport=transport)
 
-    # Monkey-patch the DashScope client used inside generate_scene to use our mock
-    from shop_pipeline.steps import generate_scene as gs
+    # Patch the real DashScope image client (looked up dynamically by factory)
+    from shop_pipeline.clients import dashscope_client
 
-    monkeypatch.setattr(gs, "generate_scene_image", lambda **kwargs: kwargs["api_key"] and __import__(
-        "shop_pipeline.clients.dashscope_client", fromlist=["ImageResult"]
-    ).ImageResult(url="https://cdn/scene.png", task_id="t1"))
+    def fake_ds(**kwargs):
+        class R:
+            url = "https://cdn.test/scene.png"
 
-    # Patch _download_to to use our mock
+        return R()
 
-    monkeypatch.setattr(gs, "_download_to", lambda url, dst, c: dst.write_bytes(image_bytes))
+    monkeypatch.setattr(dashscope_client, "generate_scene_image", fake_ds)
 
-    cfg = _make_config()
+    cfg = Config(
+        dashscope_api_key="ds",
+        kling_api_key=None, kling_api_secret=None, minimax_api_key=None,
+    )
     work = tmp_path / "out"
 
     result = run_pipeline(
@@ -89,9 +82,140 @@ def test_pipeline_with_dashscope_generates_scenes(tmp_path, monkeypatch):
         product_desc="red t-shirt",
         work_dir=work,
         generate_video=False,
+        image_provider=ImageProvider.DASHSCOPE,
+        http_client=client,
     )
     assert result.white_bg_path.exists()
-    # Scenes will be 4 (clothing template)
     assert len(result.scenes) == 4
     for s in result.scenes:
         assert s.image_path.exists()
+
+
+def test_pipeline_with_minimax_generates_scenes(tmp_path, monkeypatch):
+    """With MiniMax key, pipeline routes through MiniMax client."""
+    product = tmp_path / "product.png"
+    Image.new("RGB", (200, 200), (200, 50, 50)).save(product)
+
+    image_bytes = _png_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "cdn.test" in str(request.url):
+            return httpx.Response(200, content=image_bytes)
+        return httpx.Response(500)
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.Client(transport=transport)
+
+    from shop_pipeline.clients import minimax_image_client as mm
+
+    def fake_mm_i2i(**kwargs):
+        url = "https://cdn.test/scene.png"
+
+        class R:
+            def __init__(self):
+                self.urls = [url]
+
+        return R()
+
+    monkeypatch.setattr(mm, "generate_image_with_subject", fake_mm_i2i)
+
+    cfg = Config(
+        dashscope_api_key=None,
+        kling_api_key=None, kling_api_secret=None, minimax_api_key="sk-cp-test",
+    )
+    work = tmp_path / "out"
+
+    result = run_pipeline(
+        config=cfg,
+        product_image_path=product,
+        product_type="electronics",
+        product_desc="black earbuds",
+        work_dir=work,
+        generate_video=False,
+        image_provider=ImageProvider.MINIMAX,
+        use_subject_reference=True,
+        http_client=client,
+    )
+    assert result.white_bg_path.exists()
+    assert len(result.scenes) == 4
+    for s in result.scenes:
+        assert s.image_path.exists()
+
+
+def test_pipeline_auto_selects_provider_when_unset(tmp_path, monkeypatch):
+    """When image_provider is None, pipeline picks the first available one."""
+    product = tmp_path / "product.png"
+    Image.new("RGB", (200, 200), (200, 50, 50)).save(product)
+
+    image_bytes = _png_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "cdn.test" in str(request.url):
+            return httpx.Response(200, content=image_bytes)
+        return httpx.Response(500)
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.Client(transport=transport)
+
+    from shop_pipeline.clients import dashscope_client
+
+    def fake(**kwargs):
+        class R:
+            url = "https://cdn.test/scene.png"
+
+        return R()
+
+    monkeypatch.setattr(dashscope_client, "generate_scene_image", fake)
+
+    cfg = Config(
+        dashscope_api_key="ds",  # only dashscope available
+        kling_api_key=None, kling_api_secret=None, minimax_api_key=None,
+    )
+    work = tmp_path / "out"
+
+    result = run_pipeline(
+        config=cfg,
+        product_image_path=product,
+        product_type="clothing",
+        product_desc="red t-shirt",
+        work_dir=work,
+        generate_video=False,
+        http_client=client,
+    )
+    assert len(result.scenes) == 4
+
+
+# -------- provider registry --------
+
+
+def test_list_available_providers_filters_by_keys():
+    cfg_full = Config(
+        dashscope_api_key="d", kling_api_key="k", kling_api_secret="s", minimax_api_key="m"
+    )
+    assert ImageProvider.DASHSCOPE in list_available_providers(cfg_full)
+    assert ImageProvider.MINIMAX in list_available_providers(cfg_full)
+
+    cfg_mm_only = Config(
+        dashscope_api_key=None, kling_api_key=None, kling_api_secret=None, minimax_api_key="m"
+    )
+    assert list_available_providers(cfg_mm_only) == [ImageProvider.MINIMAX]
+
+    cfg_empty = Config(
+        dashscope_api_key=None, kling_api_key=None, kling_api_secret=None, minimax_api_key=None
+    )
+    assert list_available_providers(cfg_empty) == []
+
+
+def test_get_image_client_returns_correct_callable():
+    fn = get_image_client(ImageProvider.DASHSCOPE, use_subject_reference=False)
+    assert callable(fn)
+    fn2 = get_image_client(ImageProvider.MINIMAX, use_subject_reference=True)
+    assert callable(fn2)
+    fn3 = get_image_client(ImageProvider.MINIMAX, use_subject_reference=False)
+    # t2i and i2i are different functions
+    assert fn2 is not fn3
+
+
+def test_get_image_client_unknown_raises():
+    with pytest.raises(ValueError, match="Unknown provider"):
+        get_image_client("bogus")  # type: ignore[arg-type]

@@ -15,6 +15,10 @@ import streamlit as st
 # Make src importable when running `streamlit run app.py` from project root
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
+from shop_pipeline.clients import (
+    ImageProvider,
+    list_available_providers,
+)
 from shop_pipeline.config import Config
 from shop_pipeline.logging_setup import get_logger, setup_logging
 from shop_pipeline.pipeline import run_pipeline
@@ -35,14 +39,19 @@ except Exception as e:
     st.error(f"配置加载失败: {e}")
     st.stop()
 
+PROVIDER_LABELS = {
+    ImageProvider.DASHSCOPE: "DashScope (通义千问 / 阿里)",
+    ImageProvider.MINIMAX: "MiniMax (Xiyu / image-01)",
+}
+
 with st.sidebar:
     st.header("API 状态")
     st.write("DashScope (场景图):", "✅" if config.has_dashscope() else "❌ 未配置")
     st.write("Kling (视频):", "✅" if config.has_kling() else "❌ 未配置")
-    if not config.has_dashscope() and not config.has_kling():
-        st.info("未配置 API key,只可生成白底主图")
+    st.write("MiniMax (场景图):", "✅" if config.has_minimax() else "❌ 未配置")
     st.divider()
     st.header("生成设置")
+
     product_type = st.selectbox(
         "产品类型",
         options=["clothing", "electronics", "food", "other"],
@@ -53,15 +62,43 @@ with st.sidebar:
             "other": "其他",
         }[x],
     )
+
+    # Image provider selection (only show available ones)
+    available = list_available_providers(config)
+    if not available:
+        st.error("未配置任何图像 API key,无法生成场景图")
+        selected_provider: ImageProvider | None = None
+        do_scenes = False
+    else:
+        labels = [PROVIDER_LABELS[p] for p in available]
+        idx = st.selectbox(
+            "图像生成 Provider",
+            options=range(len(available)),
+            format_func=lambda i: labels[i],
+            help="选择用哪家的 API 生成场景图",
+        )
+        selected_provider = available[idx]
+        do_scenes = st.checkbox("生成场景图", value=True)
+
+        # Subject reference only makes sense for MiniMax (i2i mode)
+        if selected_provider == ImageProvider.MINIMAX:
+            use_subject_reference = st.checkbox(
+                "图生图(保留产品特征)",
+                value=False,
+                help="勾选后用产品图作为参考生成场景(MiniMax i2i 模式);"
+                "未勾选用纯文生图。需要产品图有公网 URL。",
+            )
+        else:
+            use_subject_reference = False
+            st.caption("(DashScope 总是用参考图,无需选择)")
+
     square_size = st.selectbox(
         "主图尺寸",
         options=[800, 1024, 1200, 2000],
         index=1,
         help="淘宝/天猫合规要求 800x800 以上",
     )
-    do_scenes = st.checkbox(
-        "生成场景图", value=config.has_dashscope(), disabled=not config.has_dashscope()
-    )
+
     do_video = st.checkbox(
         "生成产品视频", value=config.has_kling(), disabled=not config.has_kling()
     )
@@ -82,7 +119,6 @@ if uploaded is not None:
         st.error(f"文件太大: {uploaded.size / 1024 / 1024:.1f} MB (最大 10MB)")
         st.stop()
 
-    # Save to working directory
     product_id = uuid.uuid4().hex[:8]
     work_dir = Path("outputs") / product_id
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -105,12 +141,10 @@ if uploaded is not None:
     if st.button("🚀 开始生成", type="primary"):
         setup_logging(log_file=work_dir / "log.txt")
         log = get_logger("shop_pipeline.ui")
-        log.info("UI start: id=%s", product_id)
+        log.info("UI start: id=%s provider=%s", product_id, selected_provider)
 
-        progress_area = st.container()
         with st.status("正在生成...", expanded=True) as status:
             status_text = st.empty()
-            gallery = st.empty()
 
             def on_progress(stage: str, detail: str = "") -> None:
                 msg = f"**[{stage}]** {detail}"
@@ -127,6 +161,12 @@ if uploaded is not None:
                     square_size=square_size,
                     generate_video=do_video,
                     subtitle_text=subtitle if subtitle else None,
+                    image_provider=selected_provider if do_scenes else None,
+                    use_subject_reference=(
+                        use_subject_reference
+                        if selected_provider == ImageProvider.MINIMAX
+                        else False
+                    ),
                     on_progress=on_progress,
                 )
                 status.update(label="✓ 生成完成", state="complete")
@@ -138,7 +178,7 @@ if uploaded is not None:
         # Display results
         st.header("③ 结果")
         st.subheader("白底主图")
-        st.image(str(result.white_bg_path), use_container_width=False, width=400)
+        st.image(str(result.white_bg_path), width=400)
         with open(result.white_bg_path, "rb") as f:
             st.download_button(
                 "下载白底主图",
@@ -148,7 +188,10 @@ if uploaded is not None:
             )
 
         if result.scenes:
-            st.subheader(f"场景图({len(result.scenes)} 张)")
+            provider_label = (
+                PROVIDER_LABELS.get(result.image_provider, "?") if result.image_provider else "?"
+            )
+            st.subheader(f"场景图({len(result.scenes)} 张 · {provider_label})")
             cols = st.columns(min(len(result.scenes), 4))
             for i, s in enumerate(result.scenes):
                 with cols[i % 4]:

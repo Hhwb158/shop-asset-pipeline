@@ -13,13 +13,13 @@ SCENES: list[tuple[str, str, str]] = [
         "hand-held-outdoor",
         "Hand holding {product_desc} outdoors in a park, "
         "natural sunlight, lifestyle photography, authentic feel",
-        "3:4",
+        "1:1",
     ),
     (
         "kitchen-context",
         "{product_desc} in a bright modern kitchen, "
         "clean white surfaces, food photography style, appetizing",
-        "4:3",
+        "1:1",
     ),
     (
         "social-vibrant",

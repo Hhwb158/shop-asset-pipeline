@@ -10,7 +10,7 @@ from shop_pipeline.config import Config, ConfigError
 def test_config_loads_from_env_file(tmp_path, monkeypatch):
     """Config reads .env file from the project root by default."""
     # Clear any env vars from parent shell
-    for key in ("DASHSCOPE_API_KEY", "KLING_API_KEY", "KLING_API_SECRET"):
+    for key in ("DASHSCOPE_API_KEY", "KLING_API_KEY", "KLING_API_SECRET", "MINIMAX_API_KEY"):
         monkeypatch.delenv(key, raising=False)
 
     env_file = tmp_path / ".env"
@@ -18,17 +18,19 @@ def test_config_loads_from_env_file(tmp_path, monkeypatch):
         "DASHSCOPE_API_KEY=ds-test-123\n"
         "KLING_API_KEY=kl-test-456\n"
         "KLING_API_SECRET=kl-secret-789\n"
+        "MINIMAX_API_KEY=minimax-test-abc\n"
     )
 
     cfg = Config.load(env_file=env_file)
     assert cfg.dashscope_api_key == "ds-test-123"
     assert cfg.kling_api_key == "kl-test-456"
     assert cfg.kling_api_secret == "kl-secret-789"
+    assert cfg.minimax_api_key == "minimax-test-abc"
 
 
 def test_config_missing_required_key_raises(tmp_path, monkeypatch):
     """ConfigError raised when a required key is missing."""
-    for key in ("DASHSCOPE_API_KEY", "KLING_API_KEY", "KLING_API_SECRET"):
+    for key in ("DASHSCOPE_API_KEY", "KLING_API_KEY", "KLING_API_SECRET", "MINIMAX_API_KEY"):
         monkeypatch.delenv(key, raising=False)
 
     env_file = tmp_path / ".env"
@@ -38,17 +40,28 @@ def test_config_missing_required_key_raises(tmp_path, monkeypatch):
         Config.load(env_file=env_file, require_dashscope=True)
 
 
+def test_config_minimax_required_raises(tmp_path, monkeypatch):
+    """When require_minimax=True and key is empty, raise."""
+    for key in ("DASHSCOPE_API_KEY", "KLING_API_KEY", "KLING_API_SECRET", "MINIMAX_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("MINIMAX_API_KEY=\n")
+    with pytest.raises(ConfigError, match="MINIMAX_API_KEY"):
+        Config.load(env_file=env_file, require_minimax=True)
+
+
 def test_config_optional_key_not_required(tmp_path, monkeypatch):
-    """DashScope key is optional (user might only have Kling)."""
-    for key in ("DASHSCOPE_API_KEY", "KLING_API_KEY", "KLING_API_SECRET"):
+    """DashScope key is optional (user might only have Kling or MiniMax)."""
+    for key in ("DASHSCOPE_API_KEY", "KLING_API_KEY", "KLING_API_SECRET", "MINIMAX_API_KEY"):
         monkeypatch.delenv(key, raising=False)
 
     env_file = tmp_path / ".env"
-    env_file.write_text("DASHSCOPE_API_KEY=\nKLING_API_KEY=k1\nKLING_API_SECRET=s1\n")
+    env_file.write_text("DASHSCOPE_API_KEY=\nKLING_API_KEY=k1\nKLING_API_SECRET=s1\nMINIMAX_API_KEY=mx1\n")
 
     cfg = Config.load(env_file=env_file, require_dashscope=False)
     assert cfg.dashscope_api_key is None
     assert cfg.kling_api_key == "k1"
+    assert cfg.minimax_api_key == "mx1"
 
 
 def test_config_env_var_takes_precedence_over_file(tmp_path, monkeypatch):
@@ -59,3 +72,20 @@ def test_config_env_var_takes_precedence_over_file(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHSCOPE_API_KEY", "from-env")
     cfg = Config.load(env_file=env_file)
     assert cfg.dashscope_api_key == "from-env"
+
+
+def test_config_has_methods():
+    cfg = Config(
+        dashscope_api_key="d",
+        kling_api_key="k",
+        kling_api_secret="s",
+        minimax_api_key="m",
+    )
+    assert cfg.has_dashscope() and cfg.has_kling() and cfg.has_minimax()
+
+    cfg2 = Config(
+        dashscope_api_key=None, kling_api_key=None, kling_api_secret=None, minimax_api_key=None
+    )
+    assert not cfg2.has_dashscope()
+    assert not cfg2.has_kling()
+    assert not cfg2.has_minimax()

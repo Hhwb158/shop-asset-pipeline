@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from shop_pipeline.image_utils import fit_image_on_square_canvas
 from shop_pipeline.steps.remove_bg import (
     MAX_INPUT_BYTES,
     SUPPORTED_FORMATS,
@@ -107,6 +108,17 @@ def test_remove_background_to_white_resizes_to_square(tmp_path):
     remove_background_to_white(src, out, square_size=600)
     img = Image.open(out)
     assert img.size == (600, 600)
+
+
+def test_fit_image_on_square_canvas_preserves_full_wide_image():
+    src = Image.new("RGB", (400, 200), (255, 0, 0))
+    out = fit_image_on_square_canvas(src, square_size=400, padding_ratio=0)
+
+    assert out.size == (400, 400)
+    assert out.getpixel((0, 100)) == (255, 0, 0)
+    assert out.getpixel((399, 299)) == (255, 0, 0)
+    assert out.getpixel((200, 50)) == (255, 255, 255)
+    assert out.getpixel((200, 350)) == (255, 255, 255)
 
 
 def test_remove_background_to_white_supported_formats():

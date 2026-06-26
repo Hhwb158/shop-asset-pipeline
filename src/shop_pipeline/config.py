@@ -23,6 +23,7 @@ class Config:
     dashscope_api_key: str | None
     kling_api_key: str | None
     kling_api_secret: str | None
+    minimax_api_key: str | None
 
     @classmethod
     def load(
@@ -30,6 +31,7 @@ class Config:
         env_file: Path | None = None,
         require_dashscope: bool = False,
         require_kling: bool = False,
+        require_minimax: bool = False,
     ) -> Config:
         """Load config from .env file + process env.
 
@@ -41,7 +43,7 @@ class Config:
         if env_file is not None and env_file.exists():
             values.update({k: v for k, v in dotenv_values(env_file).items() if v is not None})
         # Process env overrides
-        for key in ("DASHSCOPE_API_KEY", "KLING_API_KEY", "KLING_API_SECRET"):
+        for key in ("DASHSCOPE_API_KEY", "KLING_API_KEY", "KLING_API_SECRET", "MINIMAX_API_KEY"):
             env_val = os.environ.get(key)
             if env_val:
                 values[key] = env_val
@@ -49,16 +51,20 @@ class Config:
         dashscope = values.get("DASHSCOPE_API_KEY") or None
         kling_key = values.get("KLING_API_KEY") or None
         kling_secret = values.get("KLING_API_SECRET") or None
+        minimax = values.get("MINIMAX_API_KEY") or None
 
         if require_dashscope and not dashscope:
             raise ConfigError("DASHSCOPE_API_KEY is required but not set")
         if require_kling and not (kling_key and kling_secret):
             raise ConfigError("KLING_API_KEY and KLING_API_SECRET are required but not set")
+        if require_minimax and not minimax:
+            raise ConfigError("MINIMAX_API_KEY is required but not set")
 
         return cls(
             dashscope_api_key=dashscope,
             kling_api_key=kling_key,
             kling_api_secret=kling_secret,
+            minimax_api_key=minimax,
         )
 
     def has_dashscope(self) -> bool:
@@ -66,3 +72,6 @@ class Config:
 
     def has_kling(self) -> bool:
         return bool(self.kling_api_key and self.kling_api_secret)
+
+    def has_minimax(self) -> bool:
+        return bool(self.minimax_api_key)
