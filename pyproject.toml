@@ -1,0 +1,32 @@
+[project]
+name = "shop-asset-pipeline"
+version = "0.1.0"
+description = "Shop product asset generation pipeline (white-bg / scene / video)"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF"]
+ignore = ["E501", "N818"]  # E501: line length handled by formatter; N818: NotReady is intentional
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]  # asserts are fine in tests
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: marks tests that hit real network (deselect with -m 'not integration')",
+]
+
+[tool.coverage.run]
+source = ["src/shop_pipeline"]
+omit = ["*/tests/*", "*/__init__.py"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
