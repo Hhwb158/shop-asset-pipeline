@@ -1,10 +1,12 @@
 """Top-level pipeline orchestration.
 
-Combines all steps: remove_bg → generate_scenes → generate_video.
+Combines all steps: remove_bg → generate_scenes (per SceneMode) → generate_video.
 Each step writes to its own subdirectory under the work dir.
 
-Supports pluggable image provider (DashScope or MiniMax) and
-optional subject-reference (image-to-image) mode.
+Scene mode is now strictly controlled via SceneMode (see scene_modes.py).
+We MUST NOT silently fall back to text-to-image when i2i is requested but
+not configured — that produces fake product images. Instead, the pipeline
+validates the mode and raises SceneModeError with a clear message.
 """
 
 from __future__ import annotations
@@ -19,10 +21,11 @@ from shop_pipeline.clients import (
     ImageProvider,
     get_image_client,
     list_available_providers,
-    provider_available,
 )
 from shop_pipeline.config import Config
 from shop_pipeline.logging_setup import get_logger
+from shop_pipeline.public_upload import upload_to_public_host
+from shop_pipeline.scene_modes import SceneMode, SceneModeError, validate_scene_mode
 from shop_pipeline.steps.generate_scene import SceneOutput, generate_scenes_v2
 from shop_pipeline.steps.generate_video import VideoOutput, generate_product_video
 from shop_pipeline.steps.remove_bg import remove_background_to_white
@@ -37,47 +40,20 @@ class PipelineResult:
     product_id: str
     work_dir: Path
     white_bg_path: Path
+    scene_mode: SceneMode
     image_provider: ImageProvider | None
     scenes: list[SceneOutput] = field(default_factory=list)
     video: VideoOutput | None = None
 
 
-# Public CDN-like upload (for Kling's image_url field).
-# In production you'd upload to OSS / S3 / etc. For now we skip video
-# generation when no public host is available; caller can wire one in.
-PUBLIC_IMAGE_HOST_NOTE = (
-    "Video generation needs a publicly accessible image URL. "
-    "Either upload the white-bg image to a CDN and pass that URL, "
-    "or implement upload_to_public_host() in pipeline.py."
-)
+def _provider_for_mode(config: Config, mode: SceneMode) -> ImageProvider | None:
+    """Pick the provider to use for the given scene mode.
 
-
-def upload_to_public_host(local_path: Path) -> str:
-    """Override this in production to upload to your CDN / OSS / S3."""
-    raise NotImplementedError(PUBLIC_IMAGE_HOST_NOTE)
-
-
-def _resolve_provider(
-    config: Config,
-    image_provider: ImageProvider | str | None,
-) -> ImageProvider | None:
-    """Pick the image provider, validating the API key is available.
-
-    Priority:
-      1. Explicit `image_provider` argument
-      2. First available in [DashScope, MiniMax] (deterministic order)
-      3. None (caller will skip scene generation)
+    I2I requires MiniMax; others use the first available.
+    Returns None if no provider matches.
     """
-    if image_provider is not None:
-        if isinstance(image_provider, str):
-            image_provider = ImageProvider(image_provider)
-        if not provider_available(image_provider, config):
-            available = list_available_providers(config)
-            raise ValueError(
-                f"Provider {image_provider.value} not configured. "
-                f"Available: {[p.value for p in available] or 'none'}"
-            )
-        return image_provider
+    if mode == SceneMode.I2I:
+        return ImageProvider.MINIMAX if config.has_minimax() else None
     available = list_available_providers(config)
     return available[0] if available else None
 
@@ -99,8 +75,7 @@ def run_pipeline(
     square_size: int = 1024,
     generate_video: bool = True,
     subtitle_text: str | None = None,
-    image_provider: ImageProvider | str | None = None,
-    use_subject_reference: bool = False,
+    scene_mode: SceneMode | str = SceneMode.SKIP,
     on_progress: Callable[[str, str], None] | None = None,
     http_client: httpx.Client | None = None,
 ) -> PipelineResult:
@@ -115,16 +90,30 @@ def run_pipeline(
         square_size: white-bg output side length
         generate_video: whether to also generate product video
         subtitle_text: optional Chinese subtitle for the video
-        image_provider: 'dashscope' | 'minimax' | None (auto-pick first available)
-        use_subject_reference: when True and provider is MiniMax, use i2i endpoint
+        scene_mode: SceneMode.SKIP (only white-bg) / I2I (real product) /
+            BACKGROUND_ONLY (no product in scene) / COMPOSITE (local PIL merge)
         on_progress: callback(stage, detail) for UI updates
         http_client: optional httpx.Client (for tests with MockTransport)
+
+    Raises:
+        SceneModeError: when the requested mode cannot be applied right now
+            (e.g. I2I without MiniMax key, or T2I which is disabled)
     """
+    if isinstance(scene_mode, str):
+        scene_mode = SceneMode(scene_mode)
+
+    # Step 0: validate scene mode up front — fail fast with clear message
+    validate_scene_mode(
+        scene_mode,
+        has_minimax_key=config.has_minimax(),
+        has_dashscope_key=config.has_dashscope(),
+    )
+
     work_dir.mkdir(parents=True, exist_ok=True)
     product_id = work_dir.name
     log.info(
-        "pipeline start: id=%s type=%s provider=%s i2i=%s",
-        product_id, product_type, image_provider, use_subject_reference,
+        "pipeline start: id=%s type=%s scene_mode=%s",
+        product_id, product_type, scene_mode.value,
     )
 
     own_client = http_client is None
@@ -142,26 +131,33 @@ def run_pipeline(
         remove_background_to_white(product_image_path, white_path, square_size=square_size)
         progress("white-bg", str(white_path.name))
 
-        # Step 2: scene images
+        # Step 2: scene images (mode-driven)
         scenes: list[SceneOutput] = []
         selected_provider: ImageProvider | None = None
-        try:
-            selected_provider = _resolve_provider(config, image_provider)
-        except ValueError as e:
-            log.warning("provider resolution failed: %s", e)
-            progress("scenes", f"skipped: {e}")
-
-        if selected_provider is None:
-            log.warning(
-                "no image provider available — skipping scene generation "
-                "(set DASHSCOPE_API_KEY or MINIMAX_API_KEY)"
-            )
-            progress("scenes", "skipped: no image provider configured")
+        if scene_mode == SceneMode.SKIP:
+            progress("scenes", "skipped (mode=skip)")
         else:
-            progress("scenes", f"using {selected_provider.value}")
-            image_client = get_image_client(
-                selected_provider, use_subject_reference=use_subject_reference
-            )
+            selected_provider = _provider_for_mode(config, scene_mode)
+            if selected_provider is None:
+                # Should be unreachable: validate_scene_mode raised for these cases
+                raise SceneModeError(
+                    f"scene_mode={scene_mode.value} requires a provider, but none available"
+                )
+            progress("scenes", f"using {selected_provider.value} (mode={scene_mode.value})")
+            image_client = get_image_client(selected_provider, use_subject_reference=False)
+
+            subject_url: str | None = None
+            if scene_mode == SceneMode.I2I:
+                # Pre-upload the white-bg to a public host so MiniMax i2i can use it
+                progress("scenes", "uploading white-bg to public host")
+                subject_url = upload_to_public_host(white_path)
+                (work_dir / "scenes").mkdir(parents=True, exist_ok=True)
+                (work_dir / "scenes" / "litterbox_url.txt").write_text(
+                    f"product_image_url={subject_url}\n",
+                    encoding="utf-8",
+                )
+                log.info("uploaded to: %s", subject_url)
+
             scenes = generate_scenes_v2(
                 image_client=image_client,
                 api_key=_api_key_for(config, selected_provider),
@@ -171,6 +167,8 @@ def run_pipeline(
                 out_dir=work_dir / "scenes",
                 on_progress=lambda name: progress("scenes", name),
                 client=http,
+                subject_image_url=subject_url,
+                mode=scene_mode,
             )
             progress("scenes", f"done: {len(scenes)} images")
 
@@ -210,6 +208,7 @@ def run_pipeline(
             product_id=product_id,
             work_dir=work_dir,
             white_bg_path=white_path,
+            scene_mode=scene_mode,
             image_provider=selected_provider,
             scenes=scenes,
             video=video_result,
@@ -217,4 +216,3 @@ def run_pipeline(
     finally:
         if own_client:
             http.close()
-

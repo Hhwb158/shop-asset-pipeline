@@ -90,16 +90,21 @@ def _request(
     client: httpx.Client,
     api_key: str,
     payload: dict,
+    base_url: str = DEFAULT_BASE_URL,
 ) -> dict:
-    """POST with retry on rate-limit (1002) and HTTP 5xx."""
+    """POST with retry on rate-limit (1002) and HTTP 5xx.
+
+    Uses absolute URL so callers don't need to set base_url on the client.
+    """
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    url = base_url.rstrip("/") + GENERATION_PATH
     last_exc: Exception | None = None
     for attempt in range(MAX_RETRIES + 1):
         try:
-            resp = client.post(GENERATION_PATH, headers=headers, json=payload)
+            resp = client.post(url, headers=headers, json=payload)
             if 500 <= resp.status_code < 600:
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_BACKOFF_S * (attempt + 1))
@@ -170,6 +175,9 @@ def _build_result(data: dict) -> ImageResult:
 def generate_image(
     api_key: str,
     prompt: str,
+    product_image_path: str | Path | None = None,  # accepted for protocol uniformity
+    *,
+    subject_image_url: str | None = None,  # optional: if provided, also acts as i2i
     aspect_ratio: str = "1:1",
     n: int = 1,
     model: str = DEFAULT_MODEL,
@@ -177,11 +185,15 @@ def generate_image(
     base_url: str = DEFAULT_BASE_URL,
     client: httpx.Client | None = None,
 ) -> ImageResult:
-    """Text-to-image via MiniMax.
+    """Text-to-image via MiniMax (with optional subject reference).
 
     Args:
         api_key: MiniMax API key (sk-cp-...)
         prompt: text description (≤ 1500 chars)
+        product_image_path: accepted for protocol uniformity with i2i; ignored
+        subject_image_url: if provided, image-01 will use it as subject reference
+            (the i2i behavior is the same whether you call this or
+            generate_image_with_subject, as long as the URL is provided).
         aspect_ratio: one of SUPPORTED_ASPECTS
         n: number of images (1-9)
         model: "image-01" or "image-01-live"
@@ -198,18 +210,22 @@ def generate_image(
     _validate_aspect(aspect_ratio)
     _validate_n(n)
 
-    payload = {
+    payload: dict = {
         "model": model,
         "prompt": prompt,
         "aspect_ratio": aspect_ratio,
         "n": n,
         "response_format": response_format,
     }
+    if subject_image_url:
+        payload["subject_reference"] = [
+            {"type": "character", "image_file": subject_image_url},
+        ]
 
     own_client = client is None
     http = client or httpx.Client(base_url=base_url, timeout=60.0)
     try:
-        data = _request(http, api_key, payload)
+        data = _request(http, api_key, payload, base_url=base_url)
         return _build_result(data)
     finally:
         if own_client:
@@ -249,8 +265,10 @@ def generate_image_with_subject(
         # In production this would upload the local file to a CDN first.
         # For now we expect callers to provide a public URL.
         raise MiniMaxImageError(
-            "Local product_image_path not supported yet. "
-            "Upload the file to a CDN and pass subject_image_url.",
+            "图生图模式(i2i)需要产品图有公网 URL。\n"
+            "请二选一:\n"
+            "  1. 在 UI 取消勾选 '图生图(保留产品特征)',走纯文生图模式\n"
+            "  2. 实现 upload_to_public_host() 把本地文件上传到 OSS/COS/S3 后重试",
             code=MiniMaxErrorCode.BAD_PARAMS,
         )
     if not subject_image_url:
@@ -276,7 +294,7 @@ def generate_image_with_subject(
     own_client = client is None
     http = client or httpx.Client(base_url=base_url, timeout=60.0)
     try:
-        data = _request(http, api_key, payload)
+        data = _request(http, api_key, payload, base_url=base_url)
         return _build_result(data)
     finally:
         if own_client:

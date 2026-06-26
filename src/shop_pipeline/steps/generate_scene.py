@@ -20,6 +20,7 @@ import httpx
 from shop_pipeline.clients import ImageGenerationCall
 from shop_pipeline.logging_setup import get_logger
 from shop_pipeline.prompts import get_scenes
+from shop_pipeline.scene_modes import SceneMode
 
 log = get_logger("shop_pipeline.steps.generate_scene")
 
@@ -93,13 +94,13 @@ def generate_scenes_v2(
     out_dir: Path,
     on_progress: Callable[[str], None] | None = None,
     client: httpx.Client | None = None,
+    subject_image_url: str | None = None,
+    mode: SceneMode = SceneMode.I2I,
 ) -> list[SceneOutput]:
     """Generate multiple scene images using a pluggable image client.
 
     Args:
         image_client: callable matching ImageGenerationCall protocol
-            (e.g. shop_pipeline.clients.dashscope_client.generate_scene_image
-             or shop_pipeline.clients.minimax_image_client.generate_image)
         api_key: API key for the chosen provider
         product_image_path: local path to the product image (used as reference
             for providers that support it)
@@ -108,38 +109,78 @@ def generate_scenes_v2(
         out_dir: directory to save generated images
         on_progress: optional callback(scene_name) for UI progress
         client: optional httpx.Client (for testing)
+        subject_image_url: if set, passed to the image client as a public URL
+            for i2i / subject-reference mode.
+        mode: SceneMode controlling behavior. SKIP short-circuits.
 
     Returns:
         list of SceneOutput with local file paths
     """
-    scenes = get_scenes(product_type, product_desc)
-    log.info("generating %d scenes for %s", len(scenes), product_type)
+    if mode == SceneMode.SKIP:
+        return []
+
+    # Mode-specific prompt augmentation
+    if mode == SceneMode.I2I:
+        # I2I: prompt is style/background hint, product is in the reference image.
+        # Inject a strong "do not change the product" instruction.
+        scene_prompts = [
+            {
+                **s,
+                "prompt": (
+                    f"Using the exact same product shown in the reference image: {s['prompt']}. "
+                    "Keep the product identical in shape, color, branding, and details. "
+                    "Only change the background and lighting context."
+                ),
+            }
+            for s in get_scenes(product_type, product_desc)
+        ]
+    elif mode == SceneMode.BACKGROUND_ONLY:
+        # No product in scene; user will composite later. Be explicit.
+        scene_prompts = [
+            {
+                **s,
+                "prompt": (
+                    f"Empty background scene only, no product in frame: {s['prompt']}. "
+                    "Leave the foreground area clean for later product placement. "
+                    "Do not add any product, object, or branded item."
+                ),
+            }
+            for s in get_scenes(product_type, product_desc)
+        ]
+    else:
+        # I2I / BACKGROUND_ONLY are the only supported modes that hit the API here.
+        # T2I / COMPOSITE / SKIP are handled elsewhere (T2I is rejected upstream,
+        # COMPOSITE generates the background then locally merges the white-bg).
+        scene_prompts = get_scenes(product_type, product_desc)
+
+    log.info("generating %d scenes for %s (mode=%s)", len(scene_prompts), product_type, mode.value)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     own_client = client is None
     http = client or httpx.Client(timeout=120.0)
     outputs: list[SceneOutput] = []
     try:
-        for scene in scenes:
+        for scene in scene_prompts:
             if on_progress:
                 on_progress(scene["name"])
             log.info("scene: %s (%s)", scene["name"], scene["aspect_ratio"])
-            # image_client protocols do not all accept `client`; check signature
             import inspect
 
             try:
                 sig = inspect.signature(image_client)
-                accepts_client = "client" in sig.parameters
+                params = sig.parameters
             except (TypeError, ValueError):
-                accepts_client = False
+                params = {}
             kwargs = dict(
                 api_key=api_key,
                 prompt=scene["prompt"],
                 product_image_path=product_image_path,
                 aspect_ratio=scene["aspect_ratio"],
             )
-            if accepts_client:
+            if "client" in params:
                 kwargs["client"] = http
+            if subject_image_url and "subject_image_url" in params:
+                kwargs["subject_image_url"] = subject_image_url
             result = image_client(**kwargs)
             url = _extract_url(result)
             out_path = out_dir / f"scene-{scene['name']}.png"
@@ -151,7 +192,6 @@ def generate_scenes_v2(
                     image_path=out_path,
                 )
             )
-            # Avoid hammering the API
             time.sleep(0.5)
     finally:
         if own_client:

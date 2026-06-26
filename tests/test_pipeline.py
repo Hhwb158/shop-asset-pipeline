@@ -82,7 +82,7 @@ def test_pipeline_with_dashscope_generates_scenes(tmp_path, monkeypatch):
         product_desc="red t-shirt",
         work_dir=work,
         generate_video=False,
-        image_provider=ImageProvider.DASHSCOPE,
+        scene_mode="background_only",  # i2i works with any provider in pipeline routing
         http_client=client,
     )
     assert result.white_bg_path.exists()
@@ -118,6 +118,7 @@ def test_pipeline_with_minimax_generates_scenes(tmp_path, monkeypatch):
         return R()
 
     monkeypatch.setattr(mm, "generate_image_with_subject", fake_mm_i2i)
+    monkeypatch.setattr(mm, "generate_image", fake_mm_i2i)
 
     cfg = Config(
         dashscope_api_key=None,
@@ -132,8 +133,7 @@ def test_pipeline_with_minimax_generates_scenes(tmp_path, monkeypatch):
         product_desc="black earbuds",
         work_dir=work,
         generate_video=False,
-        image_provider=ImageProvider.MINIMAX,
-        use_subject_reference=True,
+        scene_mode="background_only",
         http_client=client,
     )
     assert result.white_bg_path.exists()
@@ -180,6 +180,7 @@ def test_pipeline_auto_selects_provider_when_unset(tmp_path, monkeypatch):
         product_desc="red t-shirt",
         work_dir=work,
         generate_video=False,
+        scene_mode="background_only",
         http_client=client,
     )
     assert len(result.scenes) == 4

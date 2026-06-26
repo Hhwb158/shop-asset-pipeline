@@ -39,3 +39,4 @@ desktop.ini
 # Logs
 *.log
 logs/
+streamlit.err
